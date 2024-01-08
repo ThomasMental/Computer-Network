@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+
+import os, sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+import time
+import threading
+import argparse
+import socket
+
+from packet import Packet
+
+class Sender:
+    def __init__(self, ne_host, ne_port, port, timeout, send_file, seqnum_file, ack_file, n_file, send_sock, recv_sock):
+
+        self.ne_host = ne_host
+        self.ne_port = ne_port
+        self.port = port
+        self.timeout = timeout / 1000 # needs to be in seconds
+
+        self.send_file = send_file # file object holding the file to be sent
+        self.seqnum_file = seqnum_file # seqnum.log
+        self.ack_file = ack_file # ack.log
+        self.n_file = n_file # N.log
+
+        self.send_sock = send_sock
+        self.recv_sock = recv_sock
+
+        # internal state
+        self.lock = threading.RLock() # prevent multiple threads from accessing the data simultaneously
+        self.window = [] # To keep track of the packets in the window
+        self.window_size = 1 # Current window size 
+        self.timer = None # Threading.Timer object that calls the on_timeout function
+        self.timer_packet = None # The packet that is currently being timed
+        self.current_time = 0 # Current 'timestamp' for logging purposes
+        self.seqnum = 0 # Current sequence number
+        self.is_data_sent = True # check and send packet later if window is full
+        self.last_eot_time = 0 
+        self.isEOT = False
+
+    def run(self):
+        self.recv_sock.bind(('', self.port))
+        self.perform_handshake()
+
+        # write initial N to log
+        self.n_file.write('t={} {}\n'.format(self.current_time, self.window_size))
+        self.current_time += 1
+
+        recv_ack_thread = threading.Thread(target=sender.recv_ack)
+        send_data_thread = threading.Thread(target=sender.send_data)
+        recv_ack_thread.start()
+        send_data_thread.start()
+        
+        recv_ack_thread.join()
+        send_data_thread.join()
+
+        exit()
+
+    # Performs the connection establishment (stage 1) with the receiver
+    def perform_handshake(self):
+        # send syn packet every 3 seconds until received a SYN packet
+        while True:
+            self.recv_sock.settimeout(3)
+            try:
+                send_packet = Packet(3, 0, 0, '')
+                self.send_sock.sendto(send_packet.encode(), (self.ne_host, self.ne_port))
+                self.seqnum_file.write('t=-1 SYN\n')
+
+                recv_packet = self.recv_sock.recv(1024)
+                recv_typ, recv_seqnum, recv_length, recv_data = Packet(recv_packet).decode()
+
+                # if received the packet from the receiver
+                if recv_typ == 3:
+                    self.ack_file.write('t=-1 SYN\n')
+                    print('Handshake complete.')
+                    break
+
+            except socket.timeout:
+                print('Continue sending the SYN packet.')
+        
+        self.recv_sock.settimeout(None)
+
+    # Logs the seqnum and transmits the packet through send_sock.
+    def transmit_and_log(self, packet):
+        # log the output
+        self.seqnum_file.write('t={} {}\n'.format(self.current_time, packet.seqnum))
+
+        # send the packet and update variables
+        self.send_sock.sendto(packet.encode(), (self.ne_host, self.ne_port))
+        self.current_time += 1
+        print('Packet sent. Packet:{} {} {}'.format(packet.typ, packet.seqnum, packet.length))
+        
+    # Thread responsible for accepting acknowledgements and EOT sent from the network emulator.
+    def recv_ack(self):
+        while not self.isEOT:
+            recv_packet = self.recv_sock.recv(1024)
+            recv_typ, recv_seqnum, recv_length, recv_data = Packet(recv_packet).decode()
+            print('Packet Received. Packet:{} {} {}'.format(recv_typ, recv_seqnum, recv_length))
+
+            self.lock.acquire()
+
+            # receive EOT packet
+            if recv_typ == 2:
+                self.ack_file.write('t={} EOT\n'.format(self.current_time))
+                if len(self.window) == 0:
+                    self.lock.release()
+                    self.isEOT = True
+                    recv_sock.close()
+                    send_sock.close()
+                    quit()
+            # receive ACK packet
+            else:
+                new_ack = 0
+                recv_new_ack = False
+                while new_ack < len(self.window):
+                    if self.window[new_ack].seqnum == recv_seqnum:
+                        # reset the timer
+                        if self.timer is not None:
+                            self.timer.cancel()
+                            self.timer = None
+                        recv_new_ack = True
+                        break
+                    new_ack += 1
+
+                # if new ack is received
+                if recv_new_ack:
+                    self.window = self.window[new_ack + 1:]
+                    # N is incremented by 1 up to a maximum of 10
+                    if self.window_size < 10:
+                        self.window_size += 1
+                        self.n_file.write('t={} {}\n'.format(self.current_time, self.window_size))
+                    
+                    # but still have additional transmitted-but-yet-to-be-acknowledged packets
+                    if len(self.window) > 0:
+                        self.update_timer()
+                    else:
+                        if self.timer is not None:
+                            self.timer.cancel()
+                            self.timer = None
+
+                # Log the received ACK in ack.log
+                self.ack_file.write('t={} {}\n'.format(self.current_time, recv_seqnum))
+                self.current_time += 1
+
+            self.lock.release()
+
+
+        
+    # Thread responsible for sending data and EOT to the network emulator.
+    def send_data(self):
+        while True:
+            self.lock.acquire()
+            
+            # read the data from the file
+            if self.is_data_sent:
+                data = send_file.read(500)
+                length = len(data)
+                self.is_data_sent = False
+
+            if data == '':
+                if len(self.window) == 0:
+                    if self.isEOT:
+                        self.lock.release()
+                        break
+                    # nothing in the file and send EOT packet
+                    if time.time() - self.last_eot_time >= 3:
+                        send_packet = Packet(2, self.seqnum, 0, '')
+                        self.send_sock.sendto(send_packet.encode(), (self.ne_host, self.ne_port))
+                        self.seqnum_file.write('t={} EOT\n'.format(self.current_time))
+                        self.current_time += 1
+                        self.last_eot_time = time.time()
+
+            elif len(self.window) < self.window_size and not self.is_data_sent:
+                # send the data packet if the window is not full
+                send_packet = Packet(1, self.seqnum, length, data)
+                self.transmit_and_log(send_packet)
+                self.seqnum = (self.seqnum + 1) % 32
+                self.window.append(send_packet)
+                self.is_data_sent = True
+                self.update_timer()
+
+            self.lock.release()
+
+    # Update the timer 
+    def update_timer(self):
+        if self.timer is None:
+            # start timer for the oldest transmitted-but-not-yet-acknowledged packet
+            self.timer_packet = self.window[0]
+            self.timer = threading.Timer(self.timeout, self.on_timeout)
+            self.timer.start()
+
+    # Deals with the timeout condition
+    def on_timeout(self):
+        self.lock.acquire()
+
+        # retransmit the timer packet and set N(window size) = 1
+        print('Timeout occured on {}'.format(self.timer_packet.seqnum))
+        self.window_size = 1
+        self.n_file.write('t={} {}\n'.format(self.current_time, self.window_size))
+        self.transmit_and_log(self.timer_packet)
+
+        # reset the timer after retransmitted the packet
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        self.update_timer()
+
+        self.lock.release()
+
+if __name__ == '__main__':
+    # Parse args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("ne_host", type=str, help="Host address of the network emulator")
+    parser.add_argument("ne_port", type=int, help="UDP port number for the network emulator to receive data")
+    parser.add_argument("port", type=int, help="UDP port for receiving ACKs from the network emulator")
+    parser.add_argument("timeout", type=float, help="Sender timeout in milliseconds")
+    parser.add_argument("filename", type=str, help="Name of file to transfer")
+    args = parser.parse_args()
+   
+    with open(args.filename, 'r') as send_file, open('seqnum.log', 'w') as seqnum_file, \
+            open('ack.log', 'w') as ack_file, open('N.log', 'w') as n_file, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_sock, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as recv_sock:
+        sender = Sender(args.ne_host, args.ne_port, args.port, args.timeout, 
+            send_file, seqnum_file, ack_file, n_file, send_sock, recv_sock)
+        sender.run()
